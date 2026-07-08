@@ -1,4 +1,5 @@
 terraform {
+  required_version = ">= 1.5.0"
   required_providers {
     aws = {
       source  = "hashicorp/aws"
@@ -9,24 +10,23 @@ terraform {
 }
 
 variable "aws_region" {
-  description = "AWS region"
-  default     = "us-east-1"
+  description = "AWS region to deploy into"
+  type        = string
 }
 
 variable "project_name" {
-  description = "Project name for tagging"
+  description = "Project name used for tagging and naming"
+  type        = string
 }
 
 variable "public_key" {
-  description = "SSH public key for EC2 instance"
-}
-
-variable "db_password" {
-  description = "MySQL database password"
+  description = "SSH public key material for the EC2 key pair"
+  type        = string
 }
 
 variable "instance_type" {
   description = "EC2 instance type"
+  type        = string
   default     = "t3.micro"
 }
 
@@ -53,120 +53,68 @@ data "aws_ami" "ubuntu" {
     name   = "virtualization-type"
     values = ["hvm"]
   }
+
+  filter {
+    name   = "architecture"
+    values = ["x86_64"]
+  }
 }
 
-resource "aws_vpc" "main" {
-  cidr_block           = "10.0.0.0/16"
-  enable_dns_support   = true
-  enable_dns_hostnames = true
+resource "aws_key_pair" "app" {
+  key_name   = "${var.project_name}-keypair"
+  public_key = var.public_key
 
   tags = {
-    Name = "${var.project_name}-vpc"
+    Name = "${var.project_name}-keypair"
   }
-}
-
-resource "aws_internet_gateway" "igw" {
-  vpc_id = aws_vpc.main.id
-
-  tags = {
-    Name = "${var.project_name}-igw"
-  }
-}
-
-resource "aws_subnet" "app" {
-  vpc_id                  = aws_vpc.main.id
-  cidr_block              = "10.0.1.0/24"
-  availability_zone       = "${var.aws_region}a"
-  map_public_ip_on_launch = true
-
-  tags = {
-    Name = "${var.project_name}-subnet"
-  }
-}
-
-resource "aws_route_table" "public" {
-  vpc_id = aws_vpc.main.id
-
-  route {
-    cidr_block = "0.0.0.0/0"
-    gateway_id = aws_internet_gateway.igw.id
-  }
-
-  tags = {
-    Name = "${var.project_name}-rt"
-  }
-}
-
-resource "aws_route_table_association" "public" {
-  subnet_id      = aws_subnet.app.id
-  route_table_id = aws_route_table.public.id
 }
 
 resource "aws_security_group" "instance_sg" {
-  name        = "${var.project_name}-sg"
-  description = "Security group for ${var.project_name} app server"
-  vpc_id      = aws_vpc.main.id
+  name        = "${var.project_name}-instance-sg"
+  description = "Allow HTTP and SSH inbound; allow all outbound"
 
   tags = {
-    Name = "${var.project_name}-sg"
+    Name = "${var.project_name}-instance-sg"
   }
 }
 
 resource "aws_security_group_rule" "http_ingress" {
   type              = "ingress"
+  security_group_id = aws_security_group.instance_sg.id
   from_port         = 80
   to_port           = 80
   protocol          = "tcp"
   cidr_blocks       = ["0.0.0.0/0"]
-  security_group_id = aws_security_group.instance_sg.id
-  description       = "Allow HTTP from internet"
-}
-
-resource "aws_security_group_rule" "https_ingress" {
-  type              = "ingress"
-  from_port         = 443
-  to_port           = 443
-  protocol          = "tcp"
-  cidr_blocks       = ["0.0.0.0/0"]
-  security_group_id = aws_security_group.instance_sg.id
-  description       = "Allow HTTPS from internet"
+  description       = "Allow HTTP from anywhere"
 }
 
 resource "aws_security_group_rule" "ssh_ingress" {
   type              = "ingress"
+  security_group_id = aws_security_group.instance_sg.id
   from_port         = 22
   to_port           = 22
   protocol          = "tcp"
   cidr_blocks       = ["0.0.0.0/0"]
-  security_group_id = aws_security_group.instance_sg.id
-  description       = "Allow SSH"
+  description       = "Allow SSH from anywhere"
 }
 
-resource "aws_security_group_rule" "egress_all" {
+resource "aws_security_group_rule" "all_egress" {
   type              = "egress"
+  security_group_id = aws_security_group.instance_sg.id
   from_port         = 0
   to_port           = 0
   protocol          = "-1"
   cidr_blocks       = ["0.0.0.0/0"]
-  security_group_id = aws_security_group.instance_sg.id
   description       = "Allow all outbound"
 }
 
-resource "aws_key_pair" "app" {
-  key_name   = "${var.project_name}-key"
-  public_key = var.public_key
-
-  tags = {
-    Name = "${var.project_name}-key"
-  }
-}
-
 resource "aws_instance" "app_server" {
-  ami                    = data.aws_ami.ubuntu.id
-  instance_type          = var.instance_type
-  key_name               = aws_key_pair.app.key_name
-  subnet_id              = aws_subnet.app.id
-  vpc_security_group_ids = [aws_security_group.instance_sg.id]
+  ami                         = data.aws_ami.ubuntu.id
+  instance_type               = var.instance_type
+  key_name                    = aws_key_pair.app.key_name
+  vpc_security_group_ids      = [aws_security_group.instance_sg.id]
+  associate_public_ip_address = true
+  availability_zone           = "${var.aws_region}a"
 
   root_block_device {
     volume_size = 20
@@ -189,9 +137,11 @@ resource "aws_eip" "app" {
 }
 
 output "instance_public_ip" {
-  value = aws_eip.app.public_ip
+  description = "Static public IP of the application server"
+  value       = aws_eip.app.public_ip
 }
 
 output "app_url" {
-  value = "http://${aws_eip.app.public_ip}"
+  description = "HTTP URL of the deployed application"
+  value       = "http://${aws_eip.app.public_ip}"
 }
