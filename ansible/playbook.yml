@@ -1,0 +1,223 @@
+---
+- name: Configure Spring Boot application server
+  hosts: all
+  become: true
+  vars:
+    app_dir: /opt/app
+    app_user: springapp
+    db_name: rbsp1db
+    db_username: appuser
+    db_password: "{{ db_password }}"
+    app_port: 8080
+
+  tasks:
+    #  System update 
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    #  Java 21 
+    - name: Install Java 21 (temurin)
+      ansible.builtin.apt:
+        name:
+          - openjdk-21-jdk-headless
+        state: present
+
+    - name: Verify Java version
+      ansible.builtin.command: java -version
+      register: java_version_output
+      changed_when: false
+
+    #  MySQL Server 
+    - name: Install MySQL server and Python MySQL client
+      ansible.builtin.apt:
+        name:
+          - mysql-server
+          - python3-pymysql
+        state: present
+
+    - name: Start and enable MySQL service
+      ansible.builtin.service:
+        name: mysql
+        state: started
+        enabled: true
+
+    - name: Wait for MySQL to be ready on port 3306
+      ansible.builtin.wait_for:
+        port: 3306
+        host: 127.0.0.1
+        delay: 5
+        timeout: 120
+
+    - name: Ensure MySQL is accepting connections (retry loop)
+      ansible.builtin.command: mysqladmin ping --silent
+      register: mysql_ping
+      retries: 10
+      delay: 6
+      until: mysql_ping.rc == 0
+      changed_when: false
+
+    - name: Create application database
+      community.mysql.mysql_db:
+        name: "{{ db_name }}"
+        state: present
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+      retries: 5
+      delay: 6
+      register: db_create_result
+      until: db_create_result is not failed
+
+    - name: Create application database user
+      community.mysql.mysql_user:
+        name: "{{ db_username }}"
+        password: "{{ db_password }}"
+        priv: "{{ db_name }}.*:ALL"
+        host: "localhost"
+        state: present
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+      retries: 5
+      delay: 6
+      register: db_user_result
+      until: db_user_result is not failed
+
+    #  Nginx 
+    - name: Install Nginx
+      ansible.builtin.apt:
+        name: nginx
+        state: present
+
+    - name: Configure Nginx reverse proxy
+      ansible.builtin.copy:
+        dest: /etc/nginx/sites-available/springboot
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          server {
+              listen 80;
+              server_name _;
+
+              location / {
+                  proxy_pass         http://127.0.0.1:{{ app_port }};
+                  proxy_http_version 1.1;
+                  proxy_set_header   Host              $host;
+                  proxy_set_header   X-Real-IP         $remote_addr;
+                  proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+                  proxy_set_header   X-Forwarded-Proto $scheme;
+                  proxy_read_timeout 90;
+              }
+          }
+
+    - name: Enable Nginx site
+      ansible.builtin.file:
+        src: /etc/nginx/sites-available/springboot
+        dest: /etc/nginx/sites-enabled/springboot
+        state: link
+
+    - name: Remove default Nginx site
+      ansible.builtin.file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+
+    - name: Test Nginx configuration
+      ansible.builtin.command: nginx -t
+      changed_when: false
+
+    - name: Start and enable Nginx
+      ansible.builtin.service:
+        name: nginx
+        state: restarted
+        enabled: true
+
+    #  Application user and directory 
+    - name: Create application system user
+      ansible.builtin.user:
+        name: "{{ app_user }}"
+        system: true
+        shell: /bin/false
+        home: "{{ app_dir }}"
+        create_home: false
+
+    - name: Create application directory
+      ansible.builtin.file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0750"
+
+    #  Deploy JAR 
+    - name: Copy application JAR to server
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../ansible/jar/app.jar"
+        dest: "{{ app_dir }}/app.jar"
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0640"
+
+    #  Application environment file 
+    - name: Write application environment file
+      ansible.builtin.shell: |
+        cat > /etc/springboot.env << 'ENVEOF'
+        SERVER_PORT={{ app_port }}
+        SPRING_DATASOURCE_URL=jdbc:mysql://localhost:3306/{{ db_name }}?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+        SPRING_DATASOURCE_USERNAME={{ db_username }}
+        SPRING_DATASOURCE_PASSWORD={{ db_password }}
+        SPRING_JPA_HIBERNATE_DDL_AUTO=update
+        ENVEOF
+        chmod 600 /etc/springboot.env
+        chown {{ app_user }}:{{ app_user }} /etc/springboot.env
+      changed_when: true
+
+    #  Systemd service 
+    - name: Create systemd unit for Spring Boot application
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/spring-boot.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Spring Boot Application
+          After=network.target mysql.service
+          Requires=mysql.service
+
+          [Service]
+          Type=simple
+          User={{ app_user }}
+          WorkingDirectory={{ app_dir }}
+          EnvironmentFile=/etc/springboot.env
+          ExecStart=/usr/bin/java -jar {{ app_dir }}/app.jar
+          Restart=on-failure
+          RestartSec=10
+          StandardOutput=journal
+          StandardError=journal
+          SyslogIdentifier=spring-boot
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Reload systemd daemon
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Wait for MySQL to be ready before starting app
+      ansible.builtin.wait_for:
+        port: 3306
+        host: 127.0.0.1
+        delay: 2
+        timeout: 60
+
+    - name: Start and enable Spring Boot service
+      ansible.builtin.service:
+        name: spring-boot
+        state: restarted
+        enabled: true
+
+    - name: Wait for Spring Boot application to be ready on port 8080
+      ansible.builtin.wait_for:
+        port: "{{ app_port }}"
+        host: 127.0.0.1
+        delay: 10
+        timeout: 120

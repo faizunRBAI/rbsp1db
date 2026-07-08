@@ -1,0 +1,217 @@
+name: Deploy
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Cache Maven packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2
+          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+          restore-keys: ${{ runner.os }}-m2
+
+      - name: Run tests
+        run: ./mvnw test
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: [test]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Cache Maven packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2
+          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+          restore-keys: ${{ runner.os }}-m2
+
+      - name: Build JAR
+        run: ./mvnw -B package -DskipTests
+
+      - name: Prepare JAR for Ansible
+        run: |
+          mkdir -p ansible/jar
+          cp target/*.jar ansible/jar/app.jar
+
+      - name: Upload JAR artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-jar
+          path: ansible/jar/app.jar
+          retention-days: 1
+
+  provision:
+    name: Provision
+    runs-on: ubuntu-latest
+    needs: [build]
+    outputs:
+      instance_public_ip: ${{ steps.tf_output.outputs.instance_public_ip }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.0"
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: terraform
+        run: |
+          terraform init -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ secrets.AWS_REGION }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate"
+
+      - name: Terraform Apply
+        working-directory: terraform
+        run: |
+          terraform apply -auto-approve \
+            -var="aws_region=${{ secrets.AWS_REGION }}" \
+            -var="project_name=${{ secrets.PROJECT_NAME }}" \
+            -var="public_key=${{ secrets.SSH_PUBLIC_KEY }}" \
+            -var="db_password=${{ secrets.DB_PASSWORD }}"
+
+      - name: Capture Terraform outputs
+        id: tf_output
+        working-directory: terraform
+        run: |
+          IP=$(terraform output -raw instance_public_ip)
+          echo "instance_public_ip=${IP}" >> "$GITHUB_OUTPUT"
+
+  configure:
+    name: Configure
+    runs-on: ubuntu-latest
+    needs: [provision, build]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download JAR artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: app-jar
+          path: ansible/jar
+
+      - name: Write SSH private key
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+
+      - name: Install Ansible
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ansible python3-pip
+          pip3 install --quiet pymysql
+
+      - name: Install Ansible MySQL collection
+        run: ansible-galaxy collection install community.mysql
+
+      - name: Wait for SSH to be available
+        run: |
+          SERVER_IP="${{ needs.provision.outputs.instance_public_ip }}"
+          echo "Waiting for SSH on ${SERVER_IP}..."
+          for i in $(seq 1 30); do
+            if nc -z -w 5 "${SERVER_IP}" 22 2>/dev/null; then
+              echo "SSH is available."
+              break
+            fi
+            echo "Attempt ${i}/30 - waiting 10s..."
+            sleep 10
+          done
+
+      - name: Run Ansible playbook
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          SERVER_IP="${{ needs.provision.outputs.instance_public_ip }}"
+          ansible-playbook \
+            -i "${SERVER_IP}," \
+            -u ubuntu \
+            --private-key ~/.ssh/id_rsa \
+            -e "db_password=${{ secrets.DB_PASSWORD }}" \
+            ansible/playbook.yml
+
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+    needs: [configure]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.0"
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: terraform
+        run: |
+          terraform init -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ secrets.AWS_REGION }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate"
+
+      - name: Get app URL from Terraform output
+        id: get_url
+        working-directory: terraform
+        run: |
+          APP_URL=$(terraform output -raw app_url)
+          echo "app_url=${APP_URL}" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test application endpoint
+        run: |-
+          APP_URL="${{ steps.get_url.outputs.app_url }}"
+          echo "Probing ${APP_URL} ..."
+          for i in $(seq 1 12); do
+            STATUS=$(curl -Lsf -o /dev/null -w "%{http_code}" --max-time 10 "${APP_URL}" || true)
+            echo "Attempt ${i}: HTTP ${STATUS}"
+            if [[ "$STATUS" =~ ^[23] ]]; then
+              echo "App is healthy (HTTP ${STATUS})."
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "ERROR: App did not return a 2xx/3xx after all retries."
+          exit 1
