@@ -34,7 +34,7 @@
     - name: Install required packages
       ansible.builtin.apt:
         name:
-          - openjdk-17-jre-headless
+          - openjdk-21-jre-headless
           - nginx
           - python3-pymysql
           - curl
